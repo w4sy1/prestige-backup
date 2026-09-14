@@ -2,6 +2,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+from service import export_service,known_folders
 from runtime import atomic_json,digest,entry,files,inside,parser,read_json
 
 DENY=re.compile(r'(?i)(^\.env($|\.)|password|passwd|credential|cookie|token|secret|login data|web data|^id_(rsa|ed25519|ecdsa)|^\.ssh$|^\.aws$|^\.azure$|^\.gnupg$|^\.git$|^appdata$)')
@@ -18,7 +19,7 @@ def plan(sources):
             result.append({'source':str(path),'relative':f'{index+1}-{root.name}/{relative.as_posix()}','size':path.stat().st_size})
     return {'files':result,'excluded_count':skipped,'total_bytes':sum(p['size'] for p in result)}
 
-def backup(sources,destination):
+def backup(sources,destination,system=False,drivers=False,bookmarks=None):
     destination=Path(destination).resolve()
     for source in sources:
         if destination.is_relative_to(Path(source).resolve()):raise ValueError('Backup nie może być wewnątrz źródła.')
@@ -38,11 +39,15 @@ def backup(sources,destination):
         atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':index+1==len(data['files']) and not errors})
         if (index+1)%100==0:print(f'Postęp: {index+1}/{len(data["files"])}',file=sys.stderr)
     if not data['files']:atomic_json(destination/'manifest.json',{'schema_version':1,'files':[],'errors':[],'complete':True})
+    if system or drivers or bookmarks:
+        atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':False})
+        extra, export_errors = export_service(destination,system,drivers,bookmarks)
+        entries.extend(extra);errors.extend(export_errors)
+        atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':not errors})
     return {'copied':len(entries),'excluded':data['excluded_count'],'errors':errors,'ok':not errors,'destination':str(destination)}
 
 def verify(directory):
-    directory=Path(directory);data=read_json(directory/'manifest.json')
-    if data.get('schema_version')!=1 or not isinstance(data.get('files'),list):raise ValueError('Nieprawidłowy manifest.')
+    directory=Path(directory);data=load_manifest(directory)
     problems=[]
     for item in data['files']:
         p=inside(directory,item['path'])
@@ -50,19 +55,68 @@ def verify(directory):
         elif digest(p)!=item['sha256']:problems.append({'path':item['path'],'status':'CHANGED'})
     return {'problems':problems,'ok':not problems and data.get('complete') is True}
 
+def load_manifest(directory):
+    data=read_json(Path(directory)/'manifest.json')
+    if not isinstance(data,dict) or data.get('schema_version')!=1 or not isinstance(data.get('files'),list):
+        raise ValueError('Nieprawidłowy manifest.')
+    seen=set()
+    for item in data['files']:
+        if not isinstance(item,dict) or not isinstance(item.get('path'),str) or not re.fullmatch('[a-fA-F0-9]{64}',str(item.get('sha256',''))):
+            raise ValueError('Nieprawidłowy wpis manifestu.')
+        path=inside(directory,item['path'])
+        normalized=str(path).casefold()
+        if normalized in seen:raise ValueError('Powtórzona ścieżka manifestu.')
+        seen.add(normalized)
+    return data
+
+def restore(directory,destination,apply=False):
+    directory=Path(directory).resolve();destination=Path(destination).resolve()
+    if destination.exists() or destination.is_relative_to(directory):
+        raise ValueError('Odtwarzanie wymaga nowego katalogu poza backupem.')
+    data=load_manifest(directory)
+    check=verify(directory)
+    if not check['ok']:raise ValueError('Backup jest niekompletny lub uszkodzony.')
+    if not apply:return {'operation':'RESTORE','destination':str(destination),'files':len(data['files']),'executed':False}
+    destination.mkdir(parents=True,exist_ok=False)
+    copied=0;errors=[]
+    for item in data['files']:
+        try:
+            source=inside(directory,item['path']);target=inside(destination,item['path'])
+            target.parent.mkdir(parents=True,exist_ok=True)
+            with source.open('rb') as source_file,target.open('xb') as target_file:
+                shutil.copyfileobj(source_file,target_file)
+            if digest(target).lower()!=item['sha256'].lower():
+                target.unlink();raise ValueError('Źródło zmieniło się podczas odtwarzania.')
+            shutil.copystat(source,target);copied+=1
+        except (OSError,ValueError) as exc:
+            errors.append({'path':item['path'],'error':type(exc).__name__})
+    return {'destination':str(destination),'copied':copied,'errors':errors,'executed':True,'ok':not errors}
+
 def build():
     p=parser('Backup do nowego katalogu. Filtry wykluczają znane magazyny sekretów.')
-    p.add_argument('command',nargs='?',choices=['plan','backup','verify'])
+    p.add_argument('command',nargs='?',choices=['plan','backup','verify','restore','folders'])
     p.add_argument('--source',action='append');p.add_argument('--destination');p.add_argument('--apply',action='store_true')
+    p.add_argument('--standard-folder',action='append',choices=['Desktop','Documents','Pictures','Downloads'])
+    p.add_argument('--system-export',action='store_true',help='Lista aplikacji, sterowników i podstawowa konfiguracja Windows')
+    p.add_argument('--drivers',action='store_true',help='Eksport pakietów sterowników przez pnputil')
+    p.add_argument('--bookmarks',action='append',help='Konkretny plik Bookmarks Chromium; bez całego profilu')
+    p.add_argument('--restore-to',help='Nowy katalog odtwarzania')
     return p
 
 def handle(a):
+    if a.command=='folders':return known_folders()
+    if a.command=='restore':
+        if not a.destination or not a.restore_to:raise ValueError('Podaj --destination (backup) i --restore-to (nowy folder).')
+        return restore(a.destination,a.restore_to,a.apply)
+    if a.standard_folder:
+        known=known_folders();a.source=(a.source or [])+[known[name] for name in a.standard_folder]
     if a.command=='verify':
         if not a.destination:raise ValueError('Podaj destination.')
         return verify(a.destination)
-    if not a.source:raise ValueError('Wskaż foldery przez --source.')
-    if a.command=='plan' or (a.command=='backup' and not a.apply):return plan(a.source)
-    if a.command=='backup' and a.destination:return backup(a.source,a.destination)
+    if not a.source and not (a.system_export or a.drivers or a.bookmarks):raise ValueError('Wskaż foldery lub eksport serwisowy.')
+    a.source=a.source or []
+    if a.command=='plan' or (a.command=='backup' and not a.apply):return dict(plan(a.source),exports={'system':a.system_export,'drivers':a.drivers,'bookmarks_count':len(a.bookmarks or [])})
+    if a.command=='backup' and a.destination:return backup(a.source,a.destination,a.system_export,a.drivers,a.bookmarks)
     raise ValueError('Wybierz polecenie i destination.')
 
 if __name__=='__main__':sys.exit(entry(build,handle))

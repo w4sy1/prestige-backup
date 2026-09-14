@@ -1,5 +1,5 @@
 # Prestige Backup
-PRESTIGE TECH — by Dominik Wasilak — v0.1.0
+PRESTIGE TECH — by Dominik Wasilak — v0.2.0
 
 Kopie wybranych folderów przed serwisem z SHA256, manifestem, weryfikacją i bez nadpisywania.
 
