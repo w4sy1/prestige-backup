@@ -1,5 +1,6 @@
 """Explicit service exports. No password stores or browser profile copying."""
 import os
+import sqlite3
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from runtime import atomic_json, digest, files, powershell, read_json, run
@@ -58,13 +59,20 @@ $r|ConvertTo-Json -Depth 6''', 180)
             errors.append({'export': 'drivers', 'error': type(exc).__name__})
     for index, source in enumerate(bookmarks or []):
         try:
-            data = read_json(source)
+            if Path(source).suffix.lower() in ('.sqlite','.db'):
+                connection=sqlite3.connect(Path(source).resolve().as_uri()+'?mode=ro',uri=True)
+                try:
+                    rows=connection.execute('SELECT b.title,p.url FROM moz_bookmarks b JOIN moz_places p ON p.id=b.fk WHERE b.type=1 ORDER BY b.id').fetchmany(100001)
+                    if len(rows)>100000:raise ValueError('Zbyt wiele zakładek.')
+                    data={'roots':{'firefox':{'type':'folder','name':'Firefox','children':[{'type':'url','name':title or '', 'url':url} for title,url in rows]}}}
+                finally:connection.close()
+            else:data = read_json(source)
             if not isinstance(data, dict) or not isinstance(data.get('roots'), dict):
                 raise ValueError('Wskaż plik Bookmarks Chromium, nie cały profil.')
             cleaned = {key: clean_bookmarks(value) for key, value in data['roots'].items()}
             atomic_json(folder / f'bookmarks-{index+1}.json', {'roots': cleaned,
                 'note': 'Pominięto dane logowania, query i fragment URL oraz schematy inne niż HTTP/HTTPS.'})
-        except (OSError, RuntimeError, ValueError, TypeError) as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, sqlite3.Error) as exc:
             errors.append({'export': 'bookmarks', 'index': index+1, 'error': type(exc).__name__})
     entries = [{'path': path.relative_to(destination).as_posix(), 'sha256': digest(path), 'size': path.stat().st_size} for path in files(folder)]
     return entries, errors
