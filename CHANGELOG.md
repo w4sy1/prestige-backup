@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2
+
+- Manifest pozostaje niekompletny aż do zakończenia wszystkich etapów.
+- Weryfikacja uwzględnia błędy i rozmiary; obsługuje wielkie litery SHA256.
+- Odtwarzanie zapisuje dziennik COMPLETE / FAILED / IN_PROGRESS.
+- Testy przerwania, błędów wejścia/wyjścia i niespójnego manifestu.
+
 ## 0.2.0 — 2026-09-14
 
 Eksporty serwisowe, standardowe foldery i weryfikowane odtwarzanie do nowego katalogu.

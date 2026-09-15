@@ -1,5 +1,8 @@
 # Prestige Backup
-PRESTIGE TECH — by Dominik Wasilak — v0.3.1
+PRESTIGE TECH — by Dominik Wasilak — v0.3.2
+
+Wersja 0.3.2 poprawia końcowy stan manifestu i dodaje dziennik odtwarzania.
+Postępowanie po przerwaniu: [docs/RECOVERY.md](docs/RECOVERY.md).
 
 Kopie wybranych folderów przed serwisem z SHA256, manifestem, weryfikacją i bez nadpisywania.
 

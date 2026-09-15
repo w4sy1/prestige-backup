@@ -2,6 +2,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import uuid
 from service import export_service,known_folders
 from runtime import atomic_json,digest,entry,files,inside,parser,read_json
 
@@ -25,6 +26,7 @@ def backup(sources,destination,system=False,drivers=False,bookmarks=None,preserv
         if destination.is_relative_to(Path(source).resolve()):raise ValueError('Backup nie może być wewnątrz źródła.')
     data=plan(sources);destination.mkdir(parents=True,exist_ok=False)
     entries=[];errors=[]
+    atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':False})
     for index,item in enumerate(data['files']):
         target=inside(destination,item['relative']);target.parent.mkdir(parents=True,exist_ok=True)
         try:
@@ -36,14 +38,13 @@ def backup(sources,destination,system=False,drivers=False,bookmarks=None,preserv
                 target.unlink();raise ValueError('Zmiana źródła podczas kopii.')
             entries.append({'path':item['relative'],'sha256':value,'size':target.stat().st_size})
         except (OSError,ValueError) as exc:errors.append({'path':item['relative'],'error':type(exc).__name__})
-        atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':index+1==len(data['files']) and not errors})
+        atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':False})
         if (index+1)%100==0:print(f'Postęp: {index+1}/{len(data["files"])}',file=sys.stderr)
-    if not data['files']:atomic_json(destination/'manifest.json',{'schema_version':1,'files':[],'errors':[],'complete':True})
     if system or drivers or bookmarks:
         atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':False})
         extra, export_errors = export_service(destination,system,drivers,bookmarks)
         entries.extend(extra);errors.extend(export_errors)
-        atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':not errors})
+        atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':False})
     if preserve_acl:
         from acl import capture
         atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':False})
@@ -51,7 +52,7 @@ def backup(sources,destination,system=False,drivers=False,bookmarks=None,preserv
         metadata_path=destination/'_service/acl.json';atomic_json(metadata_path,record)
         entries.append({'path':'_service/acl.json','sha256':digest(metadata_path),'size':metadata_path.stat().st_size})
         if any(row.get('status')=='UNKNOWN' for row in record['entries']):errors.append({'export':'acl','error':'PARTIAL'})
-        atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':not errors})
+    atomic_json(destination/'manifest.json',{'schema_version':1,'files':entries,'errors':errors,'complete':not errors})
     return {'copied':len(entries),'excluded':data['excluded_count'],'errors':errors,'ok':not errors,'destination':str(destination)}
 
 def verify(directory):
@@ -60,17 +61,22 @@ def verify(directory):
     for item in data['files']:
         p=inside(directory,item['path'])
         if not p.is_file():problems.append({'path':item['path'],'status':'MISSING'})
-        elif digest(p)!=item['sha256']:problems.append({'path':item['path'],'status':'CHANGED'})
-    return {'problems':problems,'ok':not problems and data.get('complete') is True}
+        elif digest(p).lower()!=item['sha256'].lower():problems.append({'path':item['path'],'status':'CHANGED'})
+        elif 'size' in item and p.stat().st_size!=item['size']:problems.append({'path':item['path'],'status':'SIZE_MISMATCH'})
+    return {'problems':problems,'complete':data.get('complete') is True,'backup_errors':data.get('errors',[]),
+        'ok':not problems and data.get('complete') is True and not data.get('errors')}
 
 def load_manifest(directory):
     data=read_json(Path(directory)/'manifest.json')
     if not isinstance(data,dict) or data.get('schema_version')!=1 or not isinstance(data.get('files'),list):
         raise ValueError('Nieprawidłowy manifest.')
+    if not isinstance(data.get('complete'),bool) or not isinstance(data.get('errors',[]),list):
+        raise ValueError('Nieprawidłowy stan manifestu.')
     seen=set()
     for item in data['files']:
         if not isinstance(item,dict) or not isinstance(item.get('path'),str) or not re.fullmatch('[a-fA-F0-9]{64}',str(item.get('sha256',''))):
             raise ValueError('Nieprawidłowy wpis manifestu.')
+        if 'size' in item and (type(item['size']) is not int or item['size']<0):raise ValueError('Nieprawidłowy rozmiar pliku.')
         path=inside(directory,item['path'])
         normalized=str(path).casefold()
         if normalized in seen:raise ValueError('Powtórzona ścieżka manifestu.')
@@ -88,6 +94,10 @@ def restore(directory,destination,apply=False,restore_acl=False):
     if not apply:return {'operation':'RESTORE','destination':str(destination),'files':len(data['files']),'executed':False}
     destination.mkdir(parents=True,exist_ok=False)
     copied=0;errors=[]
+    journal=destination.parent/('prestige-restore-'+uuid.uuid4().hex+'.json')
+    state={'schema_version':1,'operation':'RESTORE','source':str(directory),'destination':str(destination),
+        'status':'IN_PROGRESS','copied':0,'total':len(data['files']),'errors':[]}
+    atomic_json(journal,state)
     for item in data['files']:
         try:
             source=inside(directory,item['path']);target=inside(destination,item['path'])
@@ -99,6 +109,7 @@ def restore(directory,destination,apply=False,restore_acl=False):
             shutil.copystat(source,target);copied+=1
         except (OSError,ValueError) as exc:
             errors.append({'path':item['path'],'error':type(exc).__name__})
+        state.update(copied=copied,errors=errors);atomic_json(journal,state)
     acl_result=None
     if restore_acl and not errors:
         from acl import restore as restore_permissions
@@ -106,7 +117,8 @@ def restore(directory,destination,apply=False,restore_acl=False):
         if not any(item['path']=='_service/acl.json' for item in data['files']):raise ValueError('Kopia nie zawiera zweryfikowanych danych ACL.')
         acl_result=restore_permissions(destination,read_json(acl_file))
         if not acl_result['ok']:errors.append({'stage':'restore-acl','errors':acl_result['errors']})
-    return {'destination':str(destination),'copied':copied,'errors':errors,'acl':acl_result,'executed':True,'ok':not errors}
+    state.update(status='FAILED' if errors else 'COMPLETE',copied=copied,errors=errors);atomic_json(journal,state)
+    return {'destination':str(destination),'copied':copied,'errors':errors,'acl':acl_result,'executed':True,'ok':not errors,'journal':str(journal)}
 
 def build():
     p=parser('Backup do nowego katalogu. Filtry wykluczają znane magazyny sekretów.')
